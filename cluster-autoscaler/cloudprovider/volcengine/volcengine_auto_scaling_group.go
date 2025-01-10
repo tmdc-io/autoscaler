@@ -22,8 +22,8 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
 	"k8s.io/klog/v2"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 // AutoScalingGroup represents a Volcengine 'Auto Scaling Group' which also can be treated as a node group.
@@ -69,6 +69,11 @@ func (asg *AutoScalingGroup) IncreaseSize(delta int) error {
 	return asg.manager.SetAsgTargetSize(asg.asgId, size+delta)
 }
 
+// AtomicIncreaseSize is not implemented.
+func (asg *AutoScalingGroup) AtomicIncreaseSize(delta int) error {
+	return cloudprovider.ErrNotImplemented
+}
+
 // DeleteNodes deletes nodes from this node group. Error is returned either on
 // failure or if the given node doesn't belong to this node group. This function
 // should wait until node group size is updated. Implementation required.
@@ -99,6 +104,11 @@ func (asg *AutoScalingGroup) DeleteNodes(nodes []*apiv1.Node) error {
 		instanceIds = append(instanceIds, instanceId)
 	}
 	return asg.manager.DeleteScalingInstances(asg.asgId, instanceIds)
+}
+
+// ForceDeleteNodes deletes nodes from the group regardless of constraints.
+func (asg *AutoScalingGroup) ForceDeleteNodes(nodes []*apiv1.Node) error {
+	return cloudprovider.ErrNotImplemented
 }
 
 func (asg *AutoScalingGroup) belongs(node *apiv1.Node) (bool, error) {
@@ -164,13 +174,13 @@ func (asg *AutoScalingGroup) Nodes() ([]cloudprovider.Instance, error) {
 	return nodes, nil
 }
 
-// TemplateNodeInfo returns a schedulerframework.NodeInfo structure of an empty
+// TemplateNodeInfo returns a framework.NodeInfo structure of an empty
 // (as if just started) node. This will be used in scale-up simulations to
 // predict what would a new node look like if a node group was expanded. The returned
 // NodeInfo is expected to have a fully populated Node object, with all of the labels,
 // capacity and allocatable information as well as all pods that are started on
 // the node by default, using manifest (most likely only kube-proxy). Implementation optional.
-func (asg *AutoScalingGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
+func (asg *AutoScalingGroup) TemplateNodeInfo() (*framework.NodeInfo, error) {
 	template, err := asg.manager.getAsgTemplate(asg.asgId)
 	if err != nil {
 		return nil, err
@@ -179,8 +189,7 @@ func (asg *AutoScalingGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, e
 	if err != nil {
 		return nil, err
 	}
-	nodeInfo := schedulerframework.NewNodeInfo(cloudprovider.BuildKubeProxy(asg.asgId))
-	nodeInfo.SetNode(node)
+	nodeInfo := framework.NewNodeInfo(node, nil, &framework.PodInfo{Pod: cloudprovider.BuildKubeProxy(asg.asgId)})
 	return nodeInfo, nil
 }
 

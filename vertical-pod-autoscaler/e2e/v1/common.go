@@ -144,7 +144,7 @@ func NewNHamstersDeployment(f *framework.Framework, n int) *appsv1.Deployment {
 		defaultHamsterReplicas,                     /*replicas*/
 		hamsterLabels,                              /*podLabels*/
 		GetHamsterContainerNameByIndex(0),          /*imageName*/
-		"registry.k8s.io/ubuntu-slim:0.1",          /*image*/
+		"registry.k8s.io/ubuntu-slim:0.14",         /*image*/
 		appsv1.RollingUpdateDeploymentStrategyType, /*strategyType*/
 	)
 	d.ObjectMeta.Namespace = f.Namespace.Name
@@ -241,7 +241,7 @@ func NewTestCronJob(name, schedule string, replicas int32) *batchv1.CronJob {
 }
 
 func waitForActiveJobs(c clientset.Interface, ns, cronJobName string, active int) error {
-	return wait.Poll(framework.Poll, cronJobsWaitTimeout, func() (bool, error) {
+	return wait.PollUntilContextTimeout(context.Background(), framework.Poll, cronJobsWaitTimeout, true, func(ctx context.Context) (done bool, err error) {
 		curr, err := getCronJob(c, ns, cronJobName)
 		if err != nil {
 			return false, err
@@ -278,7 +278,7 @@ func SetupHamsterContainer(cpu, memory string) apiv1.Container {
 
 	return apiv1.Container{
 		Name:  "hamster",
-		Image: "registry.k8s.io/ubuntu-slim:0.1",
+		Image: "registry.k8s.io/ubuntu-slim:0.14",
 		Resources: apiv1.ResourceRequirements{
 			Requests: apiv1.ResourceList{
 				apiv1.ResourceCPU:    cpuQuantity,
@@ -288,71 +288,6 @@ func SetupHamsterContainer(cpu, memory string) apiv1.Container {
 		Command: []string{"/bin/sh"},
 		Args:    []string{"-c", "while true; do sleep 10 ; done"},
 	}
-}
-
-// SetupVPA creates and installs a simple hamster VPA for e2e test purposes.
-func SetupVPA(f *framework.Framework, cpu string, mode vpa_types.UpdateMode, targetRef *autoscaling.CrossVersionObjectReference) *vpa_types.VerticalPodAutoscaler {
-	return SetupVPAForNHamsters(f, 1, cpu, mode, targetRef)
-}
-
-// SetupVPAForNHamsters creates and installs a simple hamster VPA for a pod with n containers, for e2e test purposes.
-func SetupVPAForNHamsters(f *framework.Framework, n int, cpu string, mode vpa_types.UpdateMode, targetRef *autoscaling.CrossVersionObjectReference) *vpa_types.VerticalPodAutoscaler {
-	return SetupVPAForNHamstersWithMinReplicas(f, n, cpu, mode, targetRef, nil)
-}
-
-// SetupVPAForNHamstersWithMinReplicas creates and installs a simple hamster VPA for a pod with n containers, setting MinReplicas. To be used for e2e test purposes.
-func SetupVPAForNHamstersWithMinReplicas(f *framework.Framework, n int, cpu string, mode vpa_types.UpdateMode, targetRef *autoscaling.CrossVersionObjectReference, minReplicas *int32) *vpa_types.VerticalPodAutoscaler {
-	vpaCRD := NewVPA(f, "hamster-vpa", targetRef, []*vpa_types.VerticalPodAutoscalerRecommenderSelector{})
-	vpaCRD.Spec.UpdatePolicy.UpdateMode = &mode
-	vpaCRD.Spec.UpdatePolicy.MinReplicas = minReplicas
-
-	cpuQuantity := ParseQuantityOrDie(cpu)
-	resourceList := apiv1.ResourceList{apiv1.ResourceCPU: cpuQuantity}
-
-	containerRecommendations := []vpa_types.RecommendedContainerResources{}
-	for i := 0; i < n; i++ {
-		containerRecommendations = append(containerRecommendations,
-			vpa_types.RecommendedContainerResources{
-				ContainerName: GetHamsterContainerNameByIndex(i),
-				Target:        resourceList,
-				LowerBound:    resourceList,
-				UpperBound:    resourceList,
-			},
-		)
-	}
-	vpaCRD.Status.Recommendation = &vpa_types.RecommendedPodResources{
-		ContainerRecommendations: containerRecommendations,
-	}
-
-	InstallVPA(f, vpaCRD)
-	return vpaCRD
-}
-
-// NewVPA creates a VPA object for e2e test purposes.
-func NewVPA(f *framework.Framework, name string, targetRef *autoscaling.CrossVersionObjectReference, recommenders []*vpa_types.VerticalPodAutoscalerRecommenderSelector) *vpa_types.VerticalPodAutoscaler {
-	updateMode := vpa_types.UpdateModeAuto
-	vpa := vpa_types.VerticalPodAutoscaler{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: f.Namespace.Name,
-		},
-		Spec: vpa_types.VerticalPodAutoscalerSpec{
-			TargetRef: targetRef,
-			UpdatePolicy: &vpa_types.PodUpdatePolicy{
-				UpdateMode: &updateMode,
-			},
-			ResourcePolicy: &vpa_types.PodResourcePolicy{
-				ContainerPolicies: []vpa_types.ContainerResourcePolicy{},
-			},
-		},
-	}
-
-	if len(recommenders) == 0 {
-		return &vpa
-	}
-
-	vpa.Spec.Recommenders = recommenders
-	return &vpa
 }
 
 type patchRecord struct {
@@ -456,7 +391,7 @@ func MakePodSet(pods *apiv1.PodList) PodSet {
 func WaitForPodsRestarted(f *framework.Framework, podList *apiv1.PodList) error {
 	initialPodSet := MakePodSet(podList)
 
-	err := wait.PollImmediate(pollInterval, pollTimeout, func() (bool, error) {
+	return wait.PollUntilContextTimeout(context.Background(), pollInterval, pollTimeout, true, func(ctx context.Context) (done bool, err error) {
 		currentPodList, err := GetHamsterPods(f)
 		if err != nil {
 			return false, err
@@ -464,18 +399,13 @@ func WaitForPodsRestarted(f *framework.Framework, podList *apiv1.PodList) error 
 		currentPodSet := MakePodSet(currentPodList)
 		return WerePodsSuccessfullyRestarted(currentPodSet, initialPodSet), nil
 	})
-
-	if err != nil {
-		return fmt.Errorf("waiting for set of pods changed: %v", err)
-	}
-	return nil
 }
 
 // WaitForPodsEvicted waits until some pods from the list are evicted.
 func WaitForPodsEvicted(f *framework.Framework, podList *apiv1.PodList) error {
 	initialPodSet := MakePodSet(podList)
 
-	err := wait.PollImmediate(pollInterval, pollTimeout, func() (bool, error) {
+	return wait.PollUntilContextTimeout(context.Background(), pollInterval, pollTimeout, true, func(ctx context.Context) (done bool, err error) {
 		currentPodList, err := GetHamsterPods(f)
 		if err != nil {
 			return false, err
@@ -483,11 +413,6 @@ func WaitForPodsEvicted(f *framework.Framework, podList *apiv1.PodList) error {
 		currentPodSet := MakePodSet(currentPodList)
 		return GetEvictedPodsCount(currentPodSet, initialPodSet) > 0, nil
 	})
-
-	if err != nil {
-		return fmt.Errorf("waiting for set of pods changed: %v", err)
-	}
-	return nil
 }
 
 // WerePodsSuccessfullyRestarted returns true if some pods from initialPodSet have been
@@ -534,8 +459,7 @@ func CheckNoPodsEvicted(f *framework.Framework, initialPodSet PodSet) {
 // polled vpa object. On timeout returns error.
 func WaitForVPAMatch(c vpa_clientset.Interface, vpa *vpa_types.VerticalPodAutoscaler, match func(vpa *vpa_types.VerticalPodAutoscaler) bool) (*vpa_types.VerticalPodAutoscaler, error) {
 	var polledVpa *vpa_types.VerticalPodAutoscaler
-	err := wait.PollImmediate(pollInterval, pollTimeout, func() (bool, error) {
-		var err error
+	err := wait.PollUntilContextTimeout(context.Background(), pollInterval, pollTimeout, true, func(ctx context.Context) (done bool, err error) {
 		polledVpa, err = c.AutoscalingV1().VerticalPodAutoscalers(vpa.Namespace).Get(context.TODO(), vpa.Name, metav1.GetOptions{})
 		if err != nil {
 			return false, err

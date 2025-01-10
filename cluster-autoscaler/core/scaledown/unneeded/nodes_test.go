@@ -21,20 +21,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	testprovider "k8s.io/autoscaler/cluster-autoscaler/cloudprovider/test"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
-	"k8s.io/autoscaler/cluster-autoscaler/context"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/status"
 	. "k8s.io/autoscaler/cluster-autoscaler/core/test"
+	"k8s.io/autoscaler/cluster-autoscaler/processors/nodes"
 	"k8s.io/autoscaler/cluster-autoscaler/simulator"
 	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	. "k8s.io/autoscaler/cluster-autoscaler/utils/test"
 	"k8s.io/client-go/kubernetes/fake"
-
-	"github.com/stretchr/testify/assert"
 )
 
 func TestUpdate(t *testing.T) {
@@ -128,7 +128,6 @@ func version(n simulator.NodeToBeRemoved) string {
 }
 
 func TestRemovableAt(t *testing.T) {
-
 	testCases := []struct {
 		name                string
 		numEmpty            int
@@ -187,10 +186,10 @@ func TestRemovableAt(t *testing.T) {
 				})
 			}
 
-			nodes := append(empty, drain...)
+			removableNodes := append(empty, drain...)
 			provider := testprovider.NewTestCloudProvider(nil, nil)
 			provider.InsertNodeGroup(ng)
-			for _, node := range nodes {
+			for _, node := range removableNodes {
 				provider.AddNode("ng", node.Node)
 			}
 
@@ -198,13 +197,17 @@ func TestRemovableAt(t *testing.T) {
 
 			rsLister, err := kube_util.NewTestReplicaSetLister(nil)
 			assert.NoError(t, err)
-			registry := kube_util.NewListerRegistry(nil, nil, nil, nil, nil, nil, nil, nil, rsLister, nil)
+			registry := kube_util.NewListerRegistry(nil, nil, nil, nil, nil, nil, nil, rsLister, nil)
 			ctx, err := NewScaleTestAutoscalingContext(config.AutoscalingOptions{ScaleDownSimulationTimeout: 5 * time.Minute}, &fake.Clientset{}, registry, provider, nil, nil)
 			assert.NoError(t, err)
 
 			n := NewNodes(&fakeScaleDownTimeGetter{}, &resource.LimitsFinder{})
-			n.Update(nodes, time.Now())
-			gotEmptyToRemove, gotDrainToRemove, _ := n.RemovableAt(&ctx, time.Now(), resource.Limits{}, []string{}, as)
+			n.Update(removableNodes, time.Now())
+			gotEmptyToRemove, gotDrainToRemove, _ := n.RemovableAt(&ctx, nodes.ScaleDownContext{
+				ActuationStatus:     as,
+				ResourcesLeft:       resource.Limits{},
+				ResourcesWithLimits: []string{},
+			}, time.Now())
 			if len(gotDrainToRemove) != tc.numDrainToRemove || len(gotEmptyToRemove) != tc.numEmptyToRemove {
 				t.Errorf("%s: getNodesToRemove() return %d, %d, want %d, %d", tc.name, len(gotEmptyToRemove), len(gotDrainToRemove), tc.numEmptyToRemove, tc.numDrainToRemove)
 			}
@@ -235,10 +238,10 @@ func (f *fakeActuationStatus) DeletionsCount(nodeGroup string) int {
 
 type fakeScaleDownTimeGetter struct{}
 
-func (f *fakeScaleDownTimeGetter) GetScaleDownUnneededTime(context *context.AutoscalingContext, nodeGroup cloudprovider.NodeGroup) (time.Duration, error) {
+func (f *fakeScaleDownTimeGetter) GetScaleDownUnneededTime(cloudprovider.NodeGroup) (time.Duration, error) {
 	return 0 * time.Second, nil
 }
 
-func (f *fakeScaleDownTimeGetter) GetScaleDownUnreadyTime(context *context.AutoscalingContext, nodeGroup cloudprovider.NodeGroup) (time.Duration, error) {
+func (f *fakeScaleDownTimeGetter) GetScaleDownUnreadyTime(cloudprovider.NodeGroup) (time.Duration, error) {
 	return 0 * time.Second, nil
 }

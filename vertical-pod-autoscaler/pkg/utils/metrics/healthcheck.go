@@ -19,6 +19,7 @@ package metrics
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -35,13 +36,22 @@ type HealthCheck struct {
 }
 
 // NewHealthCheck builds new HealthCheck object with given timeout.
-func NewHealthCheck(activityTimeout time.Duration, checkTimeout bool) *HealthCheck {
+func NewHealthCheck(activityTimeout time.Duration) *HealthCheck {
 	return &HealthCheck{
 		activityTimeout: activityTimeout,
-		checkTimeout:    checkTimeout,
+		checkTimeout:    false,
 		lastActivity:    time.Now(),
 		mutex:           &sync.Mutex{},
 	}
+}
+
+// StartMonitoring activates checks for the component inactivity.
+func (hc *HealthCheck) StartMonitoring() {
+	hc.mutex.Lock()
+	defer hc.mutex.Unlock()
+
+	hc.checkTimeout = true
+	hc.lastActivity = time.Now()
 }
 
 // checkLastActivity returns true if the last activity was too long ago, with duration from it.
@@ -66,7 +76,8 @@ func (hc *HealthCheck) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 		_, err := w.Write([]byte("OK"))
 		if err != nil {
-			klog.Fatalf("Failed to write response message: %v", err)
+			klog.ErrorS(err, "Failed to write response message")
+			os.Exit(255)
 		}
 	}
 }

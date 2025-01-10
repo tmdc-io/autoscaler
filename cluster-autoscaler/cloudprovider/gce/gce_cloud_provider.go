@@ -26,10 +26,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/gpu"
 	klog "k8s.io/klog/v2"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 const (
@@ -197,6 +197,7 @@ type gceMig struct {
 	gceManager GceManager
 	minSize    int
 	maxSize    int
+	domainUrl  string
 }
 
 // GceRef returns Mig's GceRef
@@ -234,6 +235,11 @@ func (mig *gceMig) IncreaseSize(delta int) error {
 		return fmt.Errorf("size increase too large - desired:%d max:%d", int(size)+delta, mig.MaxSize())
 	}
 	return mig.gceManager.CreateInstances(mig, int64(delta))
+}
+
+// AtomicIncreaseSize is not implemented.
+func (mig *gceMig) AtomicIncreaseSize(delta int) error {
+	return cloudprovider.ErrNotImplemented
 }
 
 // DecreaseTargetSize decreases the target size of the node group. This function
@@ -286,6 +292,11 @@ func (mig *gceMig) DeleteNodes(nodes []*apiv1.Node) error {
 	if int(size) <= mig.MinSize() {
 		return fmt.Errorf("min size reached, nodes will not be deleted")
 	}
+	return mig.ForceDeleteNodes(nodes)
+}
+
+// ForceDeleteNodes deletes nodes from the group regardless of constraints.
+func (mig *gceMig) ForceDeleteNodes(nodes []*apiv1.Node) error {
 	refs := make([]GceRef, 0, len(nodes))
 	for _, node := range nodes {
 
@@ -307,7 +318,7 @@ func (mig *gceMig) DeleteNodes(nodes []*apiv1.Node) error {
 
 // Id returns mig url.
 func (mig *gceMig) Id() string {
-	return GenerateMigUrl(mig.gceRef)
+	return GenerateMigUrl(mig.domainUrl, mig.gceRef)
 }
 
 // Debug returns a debug string for the Mig.
@@ -317,7 +328,15 @@ func (mig *gceMig) Debug() string {
 
 // Nodes returns a list of all nodes that belong to this node group.
 func (mig *gceMig) Nodes() ([]cloudprovider.Instance, error) {
-	return mig.gceManager.GetMigNodes(mig)
+	gceInstances, err := mig.gceManager.GetMigNodes(mig)
+	if err != nil {
+		return nil, err
+	}
+	instances := make([]cloudprovider.Instance, len(gceInstances), len(gceInstances))
+	for i, inst := range gceInstances {
+		instances[i] = inst.Instance
+	}
+	return instances, nil
 }
 
 // Exist checks if the node group really exists on the cloud provider side.
@@ -347,13 +366,12 @@ func (mig *gceMig) GetOptions(defaults config.NodeGroupAutoscalingOptions) (*con
 }
 
 // TemplateNodeInfo returns a node template for this node group.
-func (mig *gceMig) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
+func (mig *gceMig) TemplateNodeInfo() (*framework.NodeInfo, error) {
 	node, err := mig.gceManager.GetMigTemplateNode(mig)
 	if err != nil {
 		return nil, err
 	}
-	nodeInfo := schedulerframework.NewNodeInfo(cloudprovider.BuildKubeProxy(mig.Id()))
-	nodeInfo.SetNode(node)
+	nodeInfo := framework.NewNodeInfo(node, nil, &framework.PodInfo{Pod: cloudprovider.BuildKubeProxy(mig.Id())})
 	return nodeInfo, nil
 }
 
@@ -369,12 +387,12 @@ func BuildGCE(opts config.AutoscalingOptions, do cloudprovider.NodeGroupDiscover
 		defer config.Close()
 	}
 
-	manager, err := CreateGceManager(config, do, opts.Regional, opts.GCEOptions.ConcurrentRefreshes, opts.UserAgent, opts.GCEOptions.MigInstancesMinRefreshWaitTime)
+	manager, err := CreateGceManager(config, do, opts.GCEOptions.LocalSSDDiskSizeProvider, opts.Regional, opts.GCEOptions.BulkMigInstancesListingEnabled, opts.GCEOptions.ConcurrentRefreshes, opts.UserAgent, opts.GCEOptions.DomainUrl, opts.GCEOptions.MigInstancesMinRefreshWaitTime)
 	if err != nil {
 		klog.Fatalf("Failed to create GCE Manager: %v", err)
 	}
 
-	pricingModel := NewGcePriceModel(NewGcePriceInfo(), opts.GCEOptions.ExpanderEphemeralStorageSupport)
+	pricingModel := NewGcePriceModel(NewGcePriceInfo(), opts.GCEOptions.LocalSSDDiskSizeProvider)
 	provider, err := BuildGceCloudProvider(manager, rl, pricingModel)
 	if err != nil {
 		klog.Fatalf("Failed to create GCE cloud provider: %v", err)

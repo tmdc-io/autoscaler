@@ -25,8 +25,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
 	klog "k8s.io/klog/v2"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 const (
@@ -113,6 +113,11 @@ func (ng *cherryNodeGroup) IncreaseSize(delta int) error {
 	return nil
 }
 
+// AtomicIncreaseSize is not implemented.
+func (ng *cherryNodeGroup) AtomicIncreaseSize(delta int) error {
+	return cloudprovider.ErrNotImplemented
+}
+
 // DeleteNodes deletes a set of nodes chosen by the autoscaler.
 func (ng *cherryNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	// Batch simultaneous deletes on individual nodes
@@ -182,6 +187,11 @@ func (ng *cherryNodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	ng.targetSize = newSize
 
 	return nil
+}
+
+// ForceDeleteNodes deletes nodes from the group regardless of constraints.
+func (ng *cherryNodeGroup) ForceDeleteNodes(nodes []*apiv1.Node) error {
+	return cloudprovider.ErrNotImplemented
 }
 
 // getNodesToDelete safely gets all of the nodes added to the delete queue.
@@ -264,7 +274,7 @@ func (ng *cherryNodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 }
 
 // TemplateNodeInfo returns a node template for this node group.
-func (ng *cherryNodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
+func (ng *cherryNodeGroup) TemplateNodeInfo() (*framework.NodeInfo, error) {
 	return ng.cherryManager.templateNodeInfo(ng.id)
 }
 

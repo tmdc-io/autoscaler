@@ -19,28 +19,32 @@ package externalgrpc
 import (
 	"context"
 	"sync"
+	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider/externalgrpc/protos"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
 	klog "k8s.io/klog/v2"
-	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 // NodeGroup implements cloudprovider.NodeGroup interface. NodeGroup contains
 // configuration info and functions to control a set of nodes that have the
 // same capacity and set of labels.
 type NodeGroup struct {
-	id      string // this must be a stable identifier
-	minSize int    // cached value
-	maxSize int    // cached value
-	debug   string // cached value
-	client  protos.CloudProviderClient
+	id          string // this must be a stable identifier
+	minSize     int    // cached value
+	maxSize     int    // cached value
+	debug       string // cached value
+	client      protos.CloudProviderClient
+	grpcTimeout time.Duration
 
 	mutex    sync.Mutex
-	nodeInfo **schedulerframework.NodeInfo // used to cache NodeGroupTemplateNodeInfo() grpc calls
+	nodeInfo **framework.NodeInfo // used to cache NodeGroupTemplateNodeInfo() grpc calls
 }
 
 // MaxSize returns maximum size of the node group.
@@ -59,7 +63,7 @@ func (n *NodeGroup) MinSize() int {
 // registration or removed nodes are deleted completely). Implementation
 // required.
 func (n *NodeGroup) TargetSize() (int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), n.grpcTimeout)
 	defer cancel()
 	klog.V(5).Infof("Performing gRPC call NodeGroupTargetSize for node group %v", n.id)
 	res, err := n.client.NodeGroupTargetSize(ctx, &protos.NodeGroupTargetSizeRequest{
@@ -76,7 +80,7 @@ func (n *NodeGroup) TargetSize() (int, error) {
 // to explicitly name it and use DeleteNode. This function should wait until
 // node group size is updated. Implementation required.
 func (n *NodeGroup) IncreaseSize(delta int) error {
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), n.grpcTimeout)
 	defer cancel()
 	klog.V(5).Infof("Performing gRPC call NodeGroupIncreaseSize for node group %v", n.id)
 	_, err := n.client.NodeGroupIncreaseSize(ctx, &protos.NodeGroupIncreaseSizeRequest{
@@ -90,6 +94,11 @@ func (n *NodeGroup) IncreaseSize(delta int) error {
 	return nil
 }
 
+// AtomicIncreaseSize is not implemented.
+func (n *NodeGroup) AtomicIncreaseSize(delta int) error {
+	return cloudprovider.ErrNotImplemented
+}
+
 // DeleteNodes deletes nodes from this node group (and also increasing the size
 // of the node group with that). Error is returned either on failure or if the
 // given node doesn't belong to this node group. This function should wait
@@ -99,7 +108,7 @@ func (n *NodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	for _, n := range nodes {
 		pbNodes = append(pbNodes, externalGrpcNode(n))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), n.grpcTimeout)
 	defer cancel()
 	klog.V(5).Infof("Performing gRPC call NodeGroupDeleteNodes for node group %v", n.id)
 	_, err := n.client.NodeGroupDeleteNodes(ctx, &protos.NodeGroupDeleteNodesRequest{
@@ -113,13 +122,18 @@ func (n *NodeGroup) DeleteNodes(nodes []*apiv1.Node) error {
 	return nil
 }
 
+// ForceDeleteNodes deletes nodes from the group regardless of constraints.
+func (n *NodeGroup) ForceDeleteNodes(nodes []*apiv1.Node) error {
+	return cloudprovider.ErrNotImplemented
+}
+
 // DecreaseTargetSize decreases the target size of the node group. This function
 // doesn't permit to delete any existing node and can be used only to reduce the
 // request for new nodes that have not been yet fulfilled. Delta should be negative.
 // It is assumed that cloud provider will not delete the existing nodes when there
 // is an option to just decrease the target. Implementation required.
 func (n *NodeGroup) DecreaseTargetSize(delta int) error {
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), n.grpcTimeout)
 	defer cancel()
 	klog.V(5).Infof("Performing gRPC call NodeGroupDecreaseTargetSize for node group %v", n.id)
 	_, err := n.client.NodeGroupDecreaseTargetSize(ctx, &protos.NodeGroupDecreaseTargetSizeRequest{
@@ -147,7 +161,7 @@ func (n *NodeGroup) Debug() string {
 // required that Instance objects returned by this method have Id field set.
 // Other fields are optional.
 func (n *NodeGroup) Nodes() ([]cloudprovider.Instance, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), n.grpcTimeout)
 	defer cancel()
 	klog.V(5).Infof("Performing gRPC call NodeGroupNodes for node group %v", n.id)
 	res, err := n.client.NodeGroupNodes(ctx, &protos.NodeGroupNodesRequest{
@@ -179,7 +193,7 @@ func (n *NodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 	return instances, nil
 }
 
-// TemplateNodeInfo returns a schedulerframework.NodeInfo structure of an empty
+// TemplateNodeInfo returns a framework.NodeInfo structure of an empty
 // (as if just started) node. This will be used in scale-up simulations to
 // predict what would a new node look like if a node group was expanded. The
 // returned NodeInfo is expected to have a fully populated Node object, with
@@ -191,7 +205,7 @@ func (n *NodeGroup) Nodes() ([]cloudprovider.Instance, error) {
 // complex approach and does not cover all the scenarios. For the sake of simplicity,
 // the `nodeInfo` is defined as a Kubernetes `k8s.io.api.core.v1.Node` type
 // where the system could still extract certain info about the node.
-func (n *NodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
+func (n *NodeGroup) TemplateNodeInfo() (*framework.NodeInfo, error) {
 	n.mutex.Lock()
 	defer n.mutex.Unlock()
 
@@ -199,23 +213,26 @@ func (n *NodeGroup) TemplateNodeInfo() (*schedulerframework.NodeInfo, error) {
 		klog.V(5).Infof("Returning cached nodeInfo for node group %v", n.id)
 		return *n.nodeInfo, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), n.grpcTimeout)
 	defer cancel()
 	klog.V(5).Infof("Performing gRPC call NodeGroupTemplateNodeInfo for node group %v", n.id)
 	res, err := n.client.NodeGroupTemplateNodeInfo(ctx, &protos.NodeGroupTemplateNodeInfoRequest{
 		Id: n.id,
 	})
 	if err != nil {
+		st, ok := status.FromError(err)
+		if ok && st.Code() == codes.Unimplemented {
+			return nil, cloudprovider.ErrNotImplemented
+		}
 		klog.V(1).Infof("Error on gRPC call NodeGroupTemplateNodeInfo: %v", err)
 		return nil, err
 	}
 	pbNodeInfo := res.GetNodeInfo()
 	if pbNodeInfo == nil {
-		n.nodeInfo = new(*schedulerframework.NodeInfo)
+		n.nodeInfo = new(*framework.NodeInfo)
 		return nil, nil
 	}
-	nodeInfo := schedulerframework.NewNodeInfo()
-	nodeInfo.SetNode(pbNodeInfo)
+	nodeInfo := framework.NewNodeInfo(pbNodeInfo, nil)
 	n.nodeInfo = &nodeInfo
 	return nodeInfo, nil
 }
@@ -249,7 +266,7 @@ func (n *NodeGroup) Autoprovisioned() bool {
 // GetOptions returns NodeGroupAutoscalingOptions that should be used for this particular
 // NodeGroup. Returning a nil will result in using default options.
 func (n *NodeGroup) GetOptions(defaults config.NodeGroupAutoscalingOptions) (*config.NodeGroupAutoscalingOptions, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), grpcTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), n.grpcTimeout)
 	defer cancel()
 	klog.V(5).Infof("Performing gRPC call NodeGroupGetOptions for node group %v", n.id)
 	res, err := n.client.NodeGroupGetOptions(ctx, &protos.NodeGroupAutoscalingOptionsRequest{
@@ -263,9 +280,16 @@ func (n *NodeGroup) GetOptions(defaults config.NodeGroupAutoscalingOptions) (*co
 			ScaleDownUnreadyTime: &metav1.Duration{
 				Duration: defaults.ScaleDownUnreadyTime,
 			},
+			MaxNodeProvisionTime: &metav1.Duration{
+				Duration: defaults.MaxNodeProvisionTime,
+			},
 		},
 	})
 	if err != nil {
+		st, ok := status.FromError(err)
+		if ok && st.Code() == codes.Unimplemented {
+			return nil, cloudprovider.ErrNotImplemented
+		}
 		klog.V(1).Infof("Error on gRPC call NodeGroupGetOptions: %v", err)
 		return nil, err
 	}
@@ -278,6 +302,7 @@ func (n *NodeGroup) GetOptions(defaults config.NodeGroupAutoscalingOptions) (*co
 		ScaleDownGpuUtilizationThreshold: pbOpts.GetScaleDownGpuUtilizationThreshold(),
 		ScaleDownUnneededTime:            pbOpts.GetScaleDownUnneededTime().Duration,
 		ScaleDownUnreadyTime:             pbOpts.GetScaleDownUnreadyTime().Duration,
+		MaxNodeProvisionTime:             pbOpts.GetMaxNodeProvisionTime().Duration,
 	}
 	return opts, nil
 }

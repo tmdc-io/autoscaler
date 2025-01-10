@@ -18,17 +18,17 @@ package actuation
 
 import (
 	"sync"
-	"time"
 
 	apiv1 "k8s.io/api/core/v1"
+	"k8s.io/autoscaler/cluster-autoscaler/simulator/framework"
 	"k8s.io/klog/v2"
-	"k8s.io/kubernetes/pkg/scheduler/framework"
 
 	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	"k8s.io/autoscaler/cluster-autoscaler/config"
 	"k8s.io/autoscaler/cluster-autoscaler/context"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/deletiontracker"
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaledown/status"
+	"k8s.io/autoscaler/cluster-autoscaler/metrics"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/errors"
 )
 
@@ -60,12 +60,26 @@ func NewGroupDeletionScheduler(ctx *context.AutoscalingContext, ndt *deletiontra
 	}
 }
 
+// ResetAndReportMetrics should be invoked for GroupDeletionScheduler before each scale-down phase.
+func (ds *GroupDeletionScheduler) ResetAndReportMetrics() {
+	ds.Lock()
+	defer ds.Unlock()
+	pendingNodeDeletions := 0
+	for _, nodes := range ds.nodeQueue {
+		pendingNodeDeletions += len(nodes)
+	}
+	ds.failuresForGroup = map[string]bool{}
+	// Since the nodes are deleted asynchronously, it's easier to
+	// monitor the pending ones at the beginning of the next scale-down phase.
+	metrics.ObservePendingNodeDeletions(pendingNodeDeletions)
+}
+
 // ScheduleDeletion schedules deletion of the node. Nodes that should be deleted in groups are queued until whole group is scheduled for deletion,
 // other nodes are passed over to NodeDeletionBatcher immediately.
 func (ds *GroupDeletionScheduler) ScheduleDeletion(nodeInfo *framework.NodeInfo, nodeGroup cloudprovider.NodeGroup, batchSize int, drain bool) {
 	opts, err := nodeGroup.GetOptions(ds.ctx.NodeGroupDefaults)
-	if err != nil {
-		nodeDeleteResult := status.NodeDeleteResult{ResultType: status.NodeDeleteErrorInternal, Err: errors.NewAutoscalerError(errors.InternalError, "GetOptions returned error %v", err)}
+	if err != nil && err != cloudprovider.ErrNotImplemented {
+		nodeDeleteResult := status.NodeDeleteResult{ResultType: status.NodeDeleteErrorInternal, Err: errors.NewAutoscalerErrorf(errors.InternalError, "GetOptions returned error %v", err)}
 		ds.AbortNodeDeletion(nodeInfo.Node(), nodeGroup.Id(), drain, "failed to get autoscaling options for a node group", nodeDeleteResult)
 		return
 	}
@@ -90,7 +104,7 @@ func (ds *GroupDeletionScheduler) prepareNodeForDeletion(nodeInfo *framework.Nod
 			return status.NodeDeleteResult{ResultType: status.NodeDeleteErrorFailedToEvictPods, Err: err, PodEvictionResults: evictionResults}
 		}
 	} else {
-		if err := ds.evictor.EvictDaemonSetPods(ds.ctx, nodeInfo, time.Now()); err != nil {
+		if _, err := ds.evictor.EvictDaemonSetPods(ds.ctx, nodeInfo); err != nil {
 			// Evicting DS pods is best-effort, so proceed with the deletion even if there are errors.
 			klog.Warningf("Error while evicting DS pods from an empty node %q: %v", node.Name, err)
 		}

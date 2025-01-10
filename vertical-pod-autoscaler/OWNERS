@@ -1,13 +1,20 @@
 approvers:
-- kgolab
-- jbartosik
-- krzysied
-reviewers:
+- kwiesmueller
 - kgolab
 - jbartosik
 - krzysied
 - voelzmo
+- raywainman
+reviewers:
+- kwiesmueller
+- kgolab
+- jbartosik
+- krzysied
+- voelzmo
+- raywainman
+- adrianmoisey
+- omerap12
 emeritus_approvers:
 - schylek # 2022-09-30
 labels:
-- vertical-pod-autoscaler
+- area/vertical-pod-autoscaler

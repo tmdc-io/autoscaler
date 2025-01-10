@@ -23,17 +23,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/stretchr/testify/mock"
+
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/autoscaler/cluster-autoscaler/cloudprovider"
 	kube_types "k8s.io/kubernetes/pkg/kubelet/types"
 )
 
 // BuildTestPod creates a pod with specified resources.
-func BuildTestPod(name string, cpu int64, mem int64) *apiv1.Pod {
+func BuildTestPod(name string, cpu int64, mem int64, options ...func(*apiv1.Pod)) *apiv1.Pod {
 	startTime := metav1.Unix(0, 0)
 	pod := &apiv1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -63,8 +65,120 @@ func BuildTestPod(name string, cpu int64, mem int64) *apiv1.Pod {
 	if mem >= 0 {
 		pod.Spec.Containers[0].Resources.Requests[apiv1.ResourceMemory] = *resource.NewQuantity(mem, resource.DecimalSI)
 	}
-
+	for _, o := range options {
+		o(pod)
+	}
 	return pod
+}
+
+// MarkUnschedulable marks pod as unschedulable.
+func MarkUnschedulable() func(*apiv1.Pod) {
+	return func(pod *apiv1.Pod) {
+		pod.Status.Conditions = []apiv1.PodCondition{
+			{
+				Status: apiv1.ConditionFalse,
+				Type:   apiv1.PodScheduled,
+				Reason: apiv1.PodReasonUnschedulable,
+			},
+		}
+	}
+}
+
+// AddSchedulerName adds scheduler name to a pod.
+func AddSchedulerName(schedulerName string) func(*apiv1.Pod) {
+	return func(pod *apiv1.Pod) {
+		pod.Spec.SchedulerName = schedulerName
+	}
+}
+
+// WithResourceClaim adds a reference to the given resource claim/claim template to a pod.
+func WithResourceClaim(refName, claimName, templateName string) func(*apiv1.Pod) {
+	return func(pod *apiv1.Pod) {
+		claimRef := apiv1.PodResourceClaim{
+			Name: refName,
+		}
+		claimStatus := apiv1.PodResourceClaimStatus{
+			Name: refName,
+		}
+
+		if templateName != "" {
+			claimRef.ResourceClaimTemplateName = &templateName
+			claimStatus.ResourceClaimName = &claimName
+		} else {
+			claimRef.ResourceClaimName = &claimName
+		}
+
+		pod.Spec.ResourceClaims = append(pod.Spec.ResourceClaims, claimRef)
+		pod.Status.ResourceClaimStatuses = append(pod.Status.ResourceClaimStatuses, claimStatus)
+	}
+}
+
+// WithDSController creates a daemonSet owner ref for the pod.
+func WithDSController() func(*apiv1.Pod) {
+	return func(pod *apiv1.Pod) {
+		pod.OwnerReferences = GenerateOwnerReferences("ds", "DaemonSet", "apps/v1", "some-uid")
+	}
+}
+
+// WithNodeName sets a node name to the pod.
+func WithNodeName(nodeName string) func(*apiv1.Pod) {
+	return func(pod *apiv1.Pod) {
+		pod.Spec.NodeName = nodeName
+	}
+}
+
+// WithNamespace sets a namespace to the pod.
+func WithNamespace(namespace string) func(*apiv1.Pod) {
+	return func(pod *apiv1.Pod) {
+		pod.ObjectMeta.Namespace = namespace
+	}
+}
+
+// WithLabels sets a Labels to the pod.
+func WithLabels(labels map[string]string) func(*apiv1.Pod) {
+	return func(pod *apiv1.Pod) {
+		pod.ObjectMeta.Labels = labels
+	}
+}
+
+// WithHostPort sets a namespace to the pod.
+func WithHostPort(hostport int32) func(*apiv1.Pod) {
+	return func(pod *apiv1.Pod) {
+		if hostport > 0 {
+			pod.Spec.Containers[0].Ports = []apiv1.ContainerPort{
+				{
+					HostPort: hostport,
+				},
+			}
+		}
+	}
+}
+
+// WithMaxSkew sets a namespace to the pod.
+func WithMaxSkew(maxSkew int32, topologySpreadingKey string) func(*apiv1.Pod) {
+	return func(pod *apiv1.Pod) {
+		if maxSkew > 0 {
+			pod.Spec.TopologySpreadConstraints = []apiv1.TopologySpreadConstraint{
+				{
+					MaxSkew:           maxSkew,
+					TopologyKey:       topologySpreadingKey,
+					WhenUnsatisfiable: "DoNotSchedule",
+					LabelSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							"app": "estimatee",
+						},
+					},
+				},
+			}
+		}
+	}
+}
+
+// WithDeletionTimestamp sets deletion timestamp to the pod.
+func WithDeletionTimestamp(deletionTimestamp time.Time) func(*apiv1.Pod) {
+	return func(pod *apiv1.Pod) {
+		pod.DeletionTimestamp = &metav1.Time{Time: deletionTimestamp}
+	}
 }
 
 // BuildTestPodWithEphemeralStorage creates a pod with cpu, memory and ephemeral storage resources.
@@ -176,7 +290,7 @@ func TolerateGpuForPod(pod *apiv1.Pod) {
 }
 
 // BuildTestNode creates a node with specified capacity.
-func BuildTestNode(name string, millicpu int64, mem int64) *apiv1.Node {
+func BuildTestNode(name string, millicpuCapacity int64, memCapacity int64) *apiv1.Node {
 	node := &apiv1.Node{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:     name,
@@ -193,11 +307,11 @@ func BuildTestNode(name string, millicpu int64, mem int64) *apiv1.Node {
 		},
 	}
 
-	if millicpu >= 0 {
-		node.Status.Capacity[apiv1.ResourceCPU] = *resource.NewMilliQuantity(millicpu, resource.DecimalSI)
+	if millicpuCapacity >= 0 {
+		node.Status.Capacity[apiv1.ResourceCPU] = *resource.NewMilliQuantity(millicpuCapacity, resource.DecimalSI)
 	}
-	if mem >= 0 {
-		node.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(mem, resource.DecimalSI)
+	if memCapacity >= 0 {
+		node.Status.Capacity[apiv1.ResourceMemory] = *resource.NewQuantity(memCapacity, resource.DecimalSI)
 	}
 
 	node.Status.Allocatable = apiv1.ResourceList{}
@@ -205,6 +319,13 @@ func BuildTestNode(name string, millicpu int64, mem int64) *apiv1.Node {
 		node.Status.Allocatable[k] = v
 	}
 
+	return node
+}
+
+// WithAllocatable adds specified milliCpu and memory to Allocatable of the node in-place.
+func WithAllocatable(node *apiv1.Node, millicpuAllocatable, memAllocatable int64) *apiv1.Node {
+	node.Status.Allocatable[apiv1.ResourceCPU] = *resource.NewMilliQuantity(millicpuAllocatable, resource.DecimalSI)
+	node.Status.Allocatable[apiv1.ResourceMemory] = *resource.NewQuantity(memAllocatable, resource.DecimalSI)
 	return node
 }
 
@@ -239,20 +360,6 @@ func AddGpuLabelToNode(node *apiv1.Node) {
 // GetGPULabel return GPULabel on the node. This is only used in unit tests.
 func GetGPULabel() string {
 	return gpuLabel
-}
-
-// GetGpuConfigFromNode returns the GPU of the node if it has one. This is only used in unit tests.
-func GetGpuConfigFromNode(node *apiv1.Node) *cloudprovider.GpuConfig {
-	gpuType, hasGpuLabel := node.Labels[gpuLabel]
-	gpuAllocatable, hasGpuAllocatable := node.Status.Allocatable[resourceNvidiaGPU]
-	if hasGpuLabel || (hasGpuAllocatable && !gpuAllocatable.IsZero()) {
-		return &cloudprovider.GpuConfig{
-			Label:        gpuLabel,
-			Type:         gpuType,
-			ResourceName: resourceNvidiaGPU,
-		}
-	}
-	return nil
 }
 
 // SetNodeReadyState sets node ready state to either ConditionTrue or ConditionFalse.
@@ -395,8 +502,14 @@ func NewHttpServerMock(fields ...HttpServerMockField) *HttpServerMock {
 
 func (l *HttpServerMock) handle(req *http.Request, w http.ResponseWriter, serverMock *HttpServerMock) string {
 	url := req.URL.Path
+	query := req.URL.Query()
 	var response string
-	args := l.Called(url)
+	var args mock.Arguments
+	if query.Has("pageToken") {
+		args = l.Called(url, query.Get("pageToken"))
+	} else {
+		args = l.Called(url)
+	}
 	for i, field := range l.fields {
 		switch field {
 		case MockFieldResponse:
@@ -414,4 +527,12 @@ func (l *HttpServerMock) handle(req *http.Request, w http.ResponseWriter, server
 		}
 	}
 	return response
+}
+
+// IgnoreObjectOrder returns a cmp.Option that ignores the order of elements when comparing slices of K8s objects of type T,
+// depending on their GetName() function for sorting.
+func IgnoreObjectOrder[T interface{ GetName() string }]() cmp.Option {
+	return cmpopts.SortSlices(func(c1, c2 T) bool {
+		return c1.GetName() < c2.GetName()
+	})
 }

@@ -40,32 +40,47 @@ func (c *nodePoolCache) nodePools() map[string]*oke.NodePool {
 	return result
 }
 
-func (c *nodePoolCache) rebuild(staticNodePools map[string]NodePool) error {
+func (c *nodePoolCache) rebuild(staticNodePools map[string]NodePool, maxGetNodepoolRetries int) (err error) {
 	klog.Infof("rebuilding cache")
 	for id := range staticNodePools {
-		// prevent us from getting a node pool at the same time that we're performing delete actions on the node pool.
-		c.mu.Lock()
-		resp, err := c.okeClient.GetNodePool(context.Background(), oke.GetNodePoolRequest{
-			NodePoolId: common.String(id),
-		})
-		c.mu.Unlock()
-
-		if err != nil {
-			return err
+		var resp oke.GetNodePoolResponse
+		for i := 1; i <= maxGetNodepoolRetries; i++ {
+			// prevent us from getting a node pool at the same time that we're performing delete actions on the node pool.
+			c.mu.Lock()
+			resp, err = c.okeClient.GetNodePool(context.Background(), oke.GetNodePoolRequest{
+				NodePoolId: common.String(id),
+			})
+			c.mu.Unlock()
+			if err != nil {
+				klog.Errorf("Failed to fetch the nodepool : %v. Retries available : %v", id, maxGetNodepoolRetries-i)
+			} else {
+				break
+			}
 		}
-
-		c.set(&resp.NodePool)
+		if err != nil {
+			// in order to let cluster autoscaler still do its work even with a wrong nodepoolid,
+			// we avoid returning an error but instead log and do not add it to cache so it won't be used for scaling.
+			klog.Errorf("The nodepool will not be considered for scaling until next check : %v", id)
+		} else {
+			c.set(&resp.NodePool)
+		}
 	}
-
 	return nil
 }
 
 // removeInstance tries to remove the instance from the node pool.
-func (c *nodePoolCache) removeInstance(nodePoolID, instanceID string) error {
+func (c *nodePoolCache) removeInstance(nodePoolID, instanceID string, nodeName string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if instanceID == "" {
+		klog.Errorf("Node %s doesn't have an instance id so it can't be deleted.", nodeName)
+		klog.Errorf("This could be due to a Compute Instance issue in OCI such as Out Of Host Capacity error. Check the instance status on OCI Console.")
+		return errors.Errorf("Node %s doesn't have an instance id so it can't be deleted.", nodeName)
+	}
+
 	klog.Infof("Deleting instance %q from node pool %q", instanceID, nodePoolID)
+
 	// always try to remove the instance. This call is idempotent
 	scaleDown := true
 	resp, err := c.okeClient.DeleteNode(context.Background(), oke.DeleteNodeRequest{

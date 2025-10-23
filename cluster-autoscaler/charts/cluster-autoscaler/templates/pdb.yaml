@@ -1,7 +1,5 @@
 {{- if .Values.podDisruptionBudget -}}
-{{- if and .Values.podDisruptionBudget.minAvailable .Values.podDisruptionBudget.maxUnavailable }}
-    {{- fail "Only one of podDisruptionBudget.minAvailable or podDisruptionBudget.maxUnavailable should be set." }}
-{{- end }}apiVersion: {{ template "podDisruptionBudget.apiVersion" . }}
+apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   labels:

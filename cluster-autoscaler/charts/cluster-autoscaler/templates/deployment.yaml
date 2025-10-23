@@ -1,6 +1,6 @@
 {{- if or ( or .Values.autoDiscovery.clusterName .Values.autoDiscovery.namespace .Values.autoDiscovery.labels ) .Values.autoscalingGroups }}
 {{/* one of the above is required */}}
-apiVersion: {{ template "deployment.apiVersion" . }}
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   annotations:

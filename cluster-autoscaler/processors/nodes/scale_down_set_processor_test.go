@@ -320,6 +320,23 @@ func TestAtomicResizeFilterUnremovableNodes(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "Node without node group",
+			removableCandidates: []struct {
+				candidate simulator.NodeToBeRemoved
+				nodeGroup string
+			}{
+				{
+					candidate: buildRemovableNode("no-ng-node"),
+					nodeGroup: "",
+				},
+			},
+			scaleDownContext:    NewDefaultScaleDownContext(),
+			expectedToBeRemoved: []simulator.NodeToBeRemoved{},
+			expectedUnremovable: []simulator.UnremovableNode{
+				buildUnremovableNode("no-ng-node", simulator.NotAutoscaled),
+			},
+		},
 	}
 	for _, tc := range testCases {
 		tc := tc
@@ -345,7 +362,7 @@ func TestAtomicResizeFilterUnremovableNodes(t *testing.T) {
 			}
 			context, _ := NewScaleTestAutoscalingContext(config.AutoscalingOptions{
 				NodeGroupDefaults: config.NodeGroupAutoscalingOptions{},
-			}, &fake.Clientset{}, nil, provider, nil, nil)
+			}, &fake.Clientset{}, nil, provider, nil, nil, nil)
 			clustersnapshot.InitializeClusterSnapshotOrDie(t, context.ClusterSnapshot, nodes, nil)
 
 			toBeRemoved, unRemovable := processor.FilterUnremovableNodes(&context, tc.scaleDownContext, candidates)

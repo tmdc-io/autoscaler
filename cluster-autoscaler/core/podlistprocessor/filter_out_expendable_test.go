@@ -70,47 +70,13 @@ func TestFilterOutExpendable(t *testing.T) {
 			},
 			priorityCutoff: 3,
 		},
-		{
-			name: "single waiting-for-low-priority-preemption pod",
-			pods: []*apiv1.Pod{
-				test.BuildTestPod("p", 1000, 1, nominatedNodeName("node-1")),
-			},
-			nodes: []*apiv1.Node{
-				test.BuildTestNode("node-1", 2400, 2400),
-			},
-			wantPodsInSnapshot: []*apiv1.Pod{
-				test.BuildTestPod("p", 1000, 1, nominatedNodeName("node-1")),
-			},
-		},
-		{
-			name: "mixed expendable, non-expendable & waiting-for-low-priority-preemption pods",
-			pods: []*apiv1.Pod{
-				test.BuildTestPod("p1", 1000, 1, priority(3)),
-				test.BuildTestPod("p2", 1000, 1, priority(4)),
-				test.BuildTestPod("p3", 1000, 1, priority(1)),
-				test.BuildTestPod("p4", 1000, 1),
-				test.BuildTestPod("p5", 1000, 1, nominatedNodeName("node-1")),
-			},
-			priorityCutoff: 2,
-			wantPods: []*apiv1.Pod{
-				test.BuildTestPod("p1", 1000, 1, priority(3)),
-				test.BuildTestPod("p2", 1000, 1, priority(4)),
-				test.BuildTestPod("p4", 1000, 1),
-			},
-			wantPodsInSnapshot: []*apiv1.Pod{
-				test.BuildTestPod("p5", 1000, 1, nominatedNodeName("node-1")),
-			},
-			nodes: []*apiv1.Node{
-				test.BuildTestNode("node-1", 2400, 2400),
-			},
-		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			processor := NewFilterOutExpendablePodListProcessor()
 			snapshot := testsnapshot.NewTestSnapshotOrDie(t)
-			err := snapshot.SetClusterState(tc.nodes, nil, nil)
+			err := snapshot.SetClusterState(tc.nodes, nil, nil, nil)
 			assert.NoError(t, err)
 
 			pods, err := processor.Process(&ca_context.AutoscalingContext{

@@ -18,28 +18,30 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	corev1 "k8s.io/api/core/v1"
-
-	v1 "k8s.io/autoscaler/cluster-autoscaler/apis/capacitybuffer/autoscaling.x-k8s.io/v1alpha1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	v1 "k8s.io/autoscaler/cluster-autoscaler/apis/capacitybuffer/autoscaling.x-k8s.io/v1beta1"
 	capacitybuffer "k8s.io/autoscaler/cluster-autoscaler/apis/capacitybuffer/client/clientset/versioned"
 	"k8s.io/autoscaler/cluster-autoscaler/apis/capacitybuffer/client/informers/externalversions"
-	bufferslisters "k8s.io/autoscaler/cluster-autoscaler/apis/capacitybuffer/client/listers/autoscaling.x-k8s.io/v1alpha1"
+	bufferslisters "k8s.io/autoscaler/cluster-autoscaler/apis/capacitybuffer/client/listers/autoscaling.x-k8s.io/v1beta1"
 	"k8s.io/client-go/discovery"
 	kubernetes "k8s.io/client-go/kubernetes"
 	appsv1listers "k8s.io/client-go/listers/apps/v1"
 	batchv1lister "k8s.io/client-go/listers/batch/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	scaleclient "k8s.io/client-go/scale"
+	"k8s.io/client-go/tools/cache"
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingapi "k8s.io/api/autoscaling/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery/cached/memory"
@@ -49,6 +51,12 @@ import (
 	"k8s.io/client-go/restmapper"
 	klog "k8s.io/klog/v2"
 )
+
+// PodTemplateRefIndex is the name of the index for buffers referencing a pod template
+const PodTemplateRefIndex = "podTemplateRef"
+
+// ScalableRefIndex is the name of the index for buffers referencing a scalable object
+const ScalableRefIndex = "scalableRef"
 
 // CapacityBufferClient represents client for v1 capacitybuffer CRD.
 type CapacityBufferClient struct {
@@ -63,6 +71,17 @@ type CapacityBufferClient struct {
 	jobsLister            batchv1lister.JobLister
 	deploymentLister      appsv1listers.DeploymentLister
 	replicationContLister corev1listers.ReplicationControllerLister
+	rqLister              corev1listers.ResourceQuotaLister
+
+	// Informers
+	bufferInformer                cache.SharedIndexInformer
+	podTemplateInformer           cache.SharedIndexInformer
+	resourceQuotaInformer         cache.SharedIndexInformer
+	deploymentInformer            cache.SharedIndexInformer
+	replicaSetInformer            cache.SharedIndexInformer
+	statefulSetInformer           cache.SharedIndexInformer
+	jobInformer                   cache.SharedIndexInformer
+	replicationControllerInformer cache.SharedIndexInformer
 }
 
 // NewCapacityBufferClient returns a capacityBufferClient.
@@ -87,7 +106,12 @@ func NewCapacityBufferClient(buffersClient capacitybuffer.Interface, kubernetesC
 
 // NewCapacityBufferClientFromConfig configures and returns a CapacityBufferClient.
 func NewCapacityBufferClientFromConfig(kubeConfig *rest.Config) (*CapacityBufferClient, error) {
-	buffersClient, err := capacitybuffer.NewForConfig(kubeConfig)
+	// Use a static JSON content type config for CapacityBuffer CRD data exchange
+	// to adhere to CRD requirements. The kubernetes and scale clients below continue
+	// to use the caller-provided content type since they use built-in types.
+	buffersConfig := rest.CopyConfig(kubeConfig)
+	buffersConfig.ContentType = "application/json"
+	buffersClient, err := capacitybuffer.NewForConfig(buffersConfig)
 	if err != nil {
 		return nil, fmt.Errorf("Failed to create capacity buffer client for capacity buffer: %v", err)
 	}
@@ -121,29 +145,75 @@ func NewCapacityBufferClientFromClients(buffersClient capacitybuffer.Interface, 
 	if buffersClient == nil || kubernetesClient == nil {
 		return nil, fmt.Errorf("Couldn't create capacity buffer client")
 	}
+	defaultResyncPeriod := 5 * time.Minute
 
 	stopChannel := make(chan struct{})
-	buffersLister, err := newBuffersLister(buffersClient, stopChannel, 5*time.Second)
+
+	buffersFactory := externalversions.NewSharedInformerFactory(buffersClient, defaultResyncPeriod)
+	bufferInformer := buffersFactory.Autoscaling().V1beta1().CapacityBuffers().Informer()
+	buffersLister := buffersFactory.Autoscaling().V1beta1().CapacityBuffers().Lister()
+
+	// Add indexer for PodTemplateRef
+	err := bufferInformer.AddIndexers(cache.Indexers{
+		PodTemplateRefIndex: func(obj interface{}) ([]string, error) {
+			buffer, ok := obj.(*v1.CapacityBuffer)
+			if !ok {
+				return []string{}, nil
+			}
+			if buffer.Spec.PodTemplateRef != nil {
+				return []string{buffer.Spec.PodTemplateRef.Name}, nil
+			}
+			return []string{}, nil
+		},
+		ScalableRefIndex: func(obj interface{}) ([]string, error) {
+			buffer, ok := obj.(*v1.CapacityBuffer)
+			if !ok {
+				return []string{}, nil
+			}
+			if buffer.Spec.ScalableRef != nil {
+				return []string{buffer.Spec.ScalableRef.Name}, nil
+			}
+			return []string{}, nil
+		},
+	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to add indexers: %v", err)
 	}
 
-	factory := informers.NewSharedInformerFactory(kubernetesClient, 1*time.Minute)
+	buffersFactory.Start(stopChannel)
+	informersSynced := buffersFactory.WaitForCacheSync(stopChannel)
+	for _, synced := range informersSynced {
+		if !synced {
+			return nil, fmt.Errorf("can't create buffers lister")
+		}
+	}
+	klog.V(2).Info("Successful initial buffers sync")
+
+	factory := informers.NewSharedInformerFactory(kubernetesClient, defaultResyncPeriod)
 	bufferClient := &CapacityBufferClient{
-		buffersClient:         buffersClient,
-		kubernetesClient:      kubernetesClient,
-		scaleGetter:           scaleGetter,
-		scaleMapper:           scaleMapper,
-		buffersLister:         buffersLister,
-		podTemplateLister:     factory.Core().V1().PodTemplates().Lister(),
-		replicaSetsLister:     factory.Apps().V1().ReplicaSets().Lister(),
-		statefulSetsLister:    factory.Apps().V1().StatefulSets().Lister(),
-		jobsLister:            factory.Batch().V1().Jobs().Lister(),
-		deploymentLister:      factory.Apps().V1().Deployments().Lister(),
-		replicationContLister: factory.Core().V1().ReplicationControllers().Lister(),
+		buffersClient:                 buffersClient,
+		kubernetesClient:              kubernetesClient,
+		scaleGetter:                   scaleGetter,
+		scaleMapper:                   scaleMapper,
+		buffersLister:                 buffersLister,
+		podTemplateLister:             factory.Core().V1().PodTemplates().Lister(),
+		replicaSetsLister:             factory.Apps().V1().ReplicaSets().Lister(),
+		statefulSetsLister:            factory.Apps().V1().StatefulSets().Lister(),
+		jobsLister:                    factory.Batch().V1().Jobs().Lister(),
+		deploymentLister:              factory.Apps().V1().Deployments().Lister(),
+		replicationContLister:         factory.Core().V1().ReplicationControllers().Lister(),
+		rqLister:                      factory.Core().V1().ResourceQuotas().Lister(),
+		bufferInformer:                bufferInformer,
+		podTemplateInformer:           factory.Core().V1().PodTemplates().Informer(),
+		resourceQuotaInformer:         factory.Core().V1().ResourceQuotas().Informer(),
+		deploymentInformer:            factory.Apps().V1().Deployments().Informer(),
+		replicaSetInformer:            factory.Apps().V1().ReplicaSets().Informer(),
+		statefulSetInformer:           factory.Apps().V1().StatefulSets().Informer(),
+		jobInformer:                   factory.Batch().V1().Jobs().Informer(),
+		replicationControllerInformer: factory.Core().V1().ReplicationControllers().Informer(),
 	}
 	factory.Start(stopChannel)
-	informersSynced := factory.WaitForCacheSync(stopChannel)
+	informersSynced = factory.WaitForCacheSync(stopChannel)
 	for _, synced := range informersSynced {
 		if !synced {
 			return nil, fmt.Errorf("Can't initiate informer factory syncer")
@@ -152,29 +222,60 @@ func NewCapacityBufferClientFromClients(buffersClient capacitybuffer.Interface, 
 	return bufferClient, nil
 }
 
-// newBuffersLister creates a lister for the buffers in the cluster.
-func newBuffersLister(client capacitybuffer.Interface, stopChannel <-chan struct{}, defaultResync time.Duration) (bufferslisters.CapacityBufferLister, error) {
-	factory := externalversions.NewSharedInformerFactory(client, defaultResync)
-	buffersLister := factory.Autoscaling().V1alpha1().CapacityBuffers().Lister()
+// GetBufferInformer returns the informer for CapacityBuffer resource.
+func (c *CapacityBufferClient) GetBufferInformer() cache.SharedIndexInformer {
+	return c.bufferInformer
+}
 
-	factory.Start(stopChannel)
-	informersSynced := factory.WaitForCacheSync(stopChannel)
-	for _, synced := range informersSynced {
-		if !synced {
-			return nil, fmt.Errorf("can't create buffers lister")
-		}
-	}
-	klog.V(2).Info("Successful initial buffers sync")
-	return buffersLister, nil
+// GetPodTemplateInformer returns the informer for PodTemplate resource.
+func (c *CapacityBufferClient) GetPodTemplateInformer() cache.SharedIndexInformer {
+	return c.podTemplateInformer
+}
+
+// GetResourceQuotaInformer returns the informer for ResourceQuota resource.
+func (c *CapacityBufferClient) GetResourceQuotaInformer() cache.SharedIndexInformer {
+	return c.resourceQuotaInformer
+}
+
+// GetDeploymentInformer returns the informer for Deployment resource.
+func (c *CapacityBufferClient) GetDeploymentInformer() cache.SharedIndexInformer {
+	return c.deploymentInformer
+}
+
+// GetReplicaSetInformer returns the informer for ReplicaSet resource.
+func (c *CapacityBufferClient) GetReplicaSetInformer() cache.SharedIndexInformer {
+	return c.replicaSetInformer
+}
+
+// GetStatefulSetInformer returns the informer for StatefulSet resource.
+func (c *CapacityBufferClient) GetStatefulSetInformer() cache.SharedIndexInformer {
+	return c.statefulSetInformer
+}
+
+// GetJobInformer returns the informer for Job resource.
+func (c *CapacityBufferClient) GetJobInformer() cache.SharedIndexInformer {
+	return c.jobInformer
+}
+
+// GetReplicationControllerInformer returns the informer for ReplicationController resource.
+func (c *CapacityBufferClient) GetReplicationControllerInformer() cache.SharedIndexInformer {
+	return c.replicationControllerInformer
 }
 
 // ListCapacityBuffers lists all Capacity buffer.
-func (c *CapacityBufferClient) ListCapacityBuffers() ([]*v1.CapacityBuffer, error) {
+func (c *CapacityBufferClient) ListCapacityBuffers(namespace string) ([]*v1.CapacityBuffer, error) {
 	if c.buffersLister == nil {
 		return nil, fmt.Errorf("Capacity buffer client is not configured to list capacity buffers")
 	}
 
-	buffers, err := c.buffersLister.List(labels.Everything())
+	var buffers []*v1.CapacityBuffer
+	var err error
+	if namespace == "" {
+		buffers, err = c.buffersLister.List(labels.Everything())
+	} else {
+		buffers, err = c.buffersLister.CapacityBuffers(namespace).List(labels.Everything())
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("Error fetching capacity buffers: %v", err)
 	}
@@ -183,6 +284,25 @@ func (c *CapacityBufferClient) ListCapacityBuffers() ([]*v1.CapacityBuffer, erro
 		buffersCopy = append(buffersCopy, buffer.DeepCopy())
 	}
 	return buffersCopy, nil
+}
+
+// ListResourceQuotas lists all resource quotas in the passed namespace
+func (c *CapacityBufferClient) ListResourceQuotas(namespace string) ([]*corev1.ResourceQuota, error) {
+	if c.rqLister != nil {
+		return c.rqLister.ResourceQuotas(namespace).List(labels.Everything())
+	}
+	if c.kubernetesClient != nil {
+		rqList, err := c.kubernetesClient.CoreV1().ResourceQuotas(namespace).List(context.TODO(), metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+		res := make([]*corev1.ResourceQuota, len(rqList.Items))
+		for i := range rqList.Items {
+			res[i] = &rqList.Items[i]
+		}
+		return res, nil
+	}
+	return nil, errors.New("capacity buffer client is not configured for getting resource quotas")
 }
 
 // GetPodTemplate returns pod template with the passed name
@@ -198,7 +318,7 @@ func (c *CapacityBufferClient) GetPodTemplate(namespace, name string) (*corev1.P
 	}
 	template, err := c.kubernetesClient.CoreV1().PodTemplates(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("Capacity buffer client can't get pod template, error %v", err.Error())
+		return nil, fmt.Errorf("capacity buffer client can't get pod template: %w", err)
 	}
 	return template.DeepCopy(), nil
 }
@@ -209,7 +329,7 @@ func (c *CapacityBufferClient) UpdateCapacityBuffer(buffer *v1.CapacityBuffer) (
 		return nil, fmt.Errorf("Capacity buffer client is not configured for updating capacity buffer")
 	}
 
-	buffer, err := c.buffersClient.AutoscalingV1alpha1().CapacityBuffers(buffer.Namespace).UpdateStatus(context.TODO(), buffer, metav1.UpdateOptions{})
+	buffer, err := c.buffersClient.AutoscalingV1beta1().CapacityBuffers(buffer.Namespace).UpdateStatus(context.TODO(), buffer, metav1.UpdateOptions{})
 	if err == nil {
 		return buffer.DeepCopy(), nil
 	}
@@ -238,6 +358,28 @@ func (c *CapacityBufferClient) UpdatePodTemplate(podTemplate *corev1.PodTemplate
 		return template.DeepCopy(), nil
 	}
 	return nil, err
+}
+
+// EnsurePodTemplate upserts a pod template.
+func (c *CapacityBufferClient) EnsurePodTemplate(ctx context.Context, podTemplate *corev1.PodTemplate) (*corev1.PodTemplate, error) {
+	if c.kubernetesClient == nil {
+		return nil, fmt.Errorf("capacity buffer client is not configured for applying pod template")
+	}
+
+	// Try to use the lister first to avoid unnecessary API calls.
+	existing, err := c.GetPodTemplate(podTemplate.Namespace, podTemplate.Name)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return c.kubernetesClient.CoreV1().PodTemplates(podTemplate.Namespace).Create(ctx, podTemplate, metav1.CreateOptions{})
+		}
+		return nil, err
+	}
+	if equality.Semantic.DeepEqual(existing.Template, podTemplate.Template) {
+		return existing, nil
+	}
+	existing.OwnerReferences = podTemplate.OwnerReferences
+	existing.Template = podTemplate.Template
+	return c.kubernetesClient.CoreV1().PodTemplates(podTemplate.Namespace).Update(ctx, existing, metav1.UpdateOptions{})
 }
 
 // GetDeployment fetches the cached object using a lister object in the client

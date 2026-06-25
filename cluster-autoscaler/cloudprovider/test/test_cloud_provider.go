@@ -52,6 +52,7 @@ type NodeGpuConfig func(node *apiv1.Node) *cloudprovider.GpuConfig
 type TestCloudProvider struct {
 	sync.Mutex
 	nodes             map[string]string
+	errNodes          map[string]bool
 	groups            map[string]cloudprovider.NodeGroup
 	onScaleUp         func(string, int) error
 	onScaleDown       func(string, string) error
@@ -139,12 +140,28 @@ func (b *TestCloudProviderBuilder) WithNodeGpuConfig(nodeGpuConfig NodeGpuConfig
 	return b
 }
 
+// WithNodeProcessingError specifies nodes that should trigger error if present in provider arguments.
+// This method is used to test error handling.
+func (b *TestCloudProviderBuilder) WithNodeProcessingError(nodeNames []string) *TestCloudProviderBuilder {
+	b.builders = append(b.builders, func(p *TestCloudProvider) {
+		for _, n := range nodeNames {
+			p.errNodes[n] = true
+		}
+	})
+	return b
+}
+
 // Build returns a built test cloud provider
 func (b *TestCloudProviderBuilder) Build() *TestCloudProvider {
 	p := &TestCloudProvider{
-		nodes:           make(map[string]string),
-		groups:          make(map[string]cloudprovider.NodeGroup),
-		resourceLimiter: cloudprovider.NewResourceLimiter(make(map[string]int64), make(map[string]int64)),
+		nodes:             make(map[string]string),
+		errNodes:          make(map[string]bool),
+		groups:            make(map[string]cloudprovider.NodeGroup),
+		onScaleUp:         func(string, int) error { return nil },
+		onScaleDown:       func(string, string) error { return nil },
+		onNodeGroupCreate: func(string) error { return nil },
+		onNodeGroupDelete: func(string) error { return nil },
+		resourceLimiter:   cloudprovider.NewResourceLimiter(make(map[string]int64), make(map[string]int64)),
 	}
 
 	for _, builder := range b.builders {
@@ -207,6 +224,9 @@ func (tcp *TestCloudProvider) NodeGroupForNode(node *apiv1.Node) (cloudprovider.
 	tcp.Lock()
 	defer tcp.Unlock()
 
+	if _, found := tcp.errNodes[node.Name]; found {
+		return nil, errors.NewAutoscalerErrorf(errors.CloudProviderError, "node %q encountered", node.Name)
+	}
 	groupName, found := tcp.nodes[node.Name]
 	if !found {
 		return nil, nil
@@ -226,6 +246,9 @@ func (tcp *TestCloudProvider) HasInstance(node *apiv1.Node) (bool, error) {
 	defer tcp.Unlock()
 	if tcp.hasInstance != nil {
 		return tcp.hasInstance(node.Name)
+	}
+	if _, found := tcp.errNodes[node.Name]; found {
+		return false, errors.NewAutoscalerErrorf(errors.CloudProviderError, "node %q encountered", node.Name)
 	}
 	_, found := tcp.nodes[node.Name]
 	return found, nil

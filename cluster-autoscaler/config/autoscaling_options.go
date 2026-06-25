@@ -50,6 +50,8 @@ type NodeGroupAutoscalingOptions struct {
 	ScaleDownUnreadyTime time.Duration
 	// Maximum time CA waits for node to be provisioned
 	MaxNodeProvisionTime time.Duration
+	// Maximum time CA waits for node to be ready from registered
+	MaxNodeStartupTime time.Duration
 	// ZeroOrMaxNodeScaling means that a node group should be scaled up to maximum size or down to zero nodes all at once instead of one-by-one.
 	ZeroOrMaxNodeScaling bool
 	// AllowNonAtomicScaleUpToMax indicates that partially failing scale-ups of ZeroOrMaxNodeScaling node groups should not be cancelled
@@ -146,6 +148,10 @@ type AutoscalingOptions struct {
 	ScaleUpFromZero bool
 	// ParallelScaleUp defines whether CA can scale up node groups in parallel.
 	ParallelScaleUp bool
+	// SalvoScaleUp defines whether CA can scale up multiple node groups in a single CA loop.
+	SalvoScaleUp bool
+	// SalvoScaleUpBudget defines the maximum time CA spends on scale ups in a single CA loop.
+	SalvoScaleUpBudget time.Duration
 	// CloudConfig is the path to the cloud provider configuration file. Empty string for no configuration file.
 	CloudConfig string
 	// CloudProviderName sets the type of the cloud provider CA is about to run in. Allowed values: gce, aws
@@ -218,6 +224,9 @@ type AutoscalingOptions struct {
 	// status that should be removed when creating a node template for scheduling.
 	// startup taints are expected to appear during node startup.
 	StartupTaints []string
+	// StartupTaintPrefixes is a list of taint key prefixes. Any taint whose key starts
+	// with one of these prefixes will be treated as a startup taint.
+	StartupTaintPrefixes []string
 	// StatusTaints is a list of taints CA considers to reflect transient node
 	// status that should be removed when creating a node template for scheduling.
 	// The status taints are expected to appear during node lifetime, after startup.
@@ -230,6 +239,9 @@ type AutoscalingOptions struct {
 	BalancingLabels []string
 	// AWSUseStaticInstanceList tells if AWS cloud provider use static instance type list or dynamically fetch from remote APIs.
 	AWSUseStaticInstanceList bool
+	// ScaleFromUnschedulable tells the autoscaler to ignore a node's .spec.unschedulable field when creating a node template.
+	// Specifically, this will cause the autoscaler to set the node template's .spec.unschedulable field to false.
+	ScaleFromUnschedulable bool
 	// GCEOptions contain autoscaling options specific to GCE cloud provider.
 	GCEOptions GCEOptions
 	// KubeClientOpts specify options for kube client
@@ -267,6 +279,8 @@ type AutoscalingOptions struct {
 	// MaxBinpackingTime is the maximum time spend on binpacking for a single scale-up.
 	// If binpacking is limited by this, scale-up will continue with the already calculated scale-up options.
 	MaxBinpackingTime time.Duration
+	// FastpathBinpackingEnabled tells if to use fastpath binpacking algorithm to optimize scale-ups.
+	FastpathBinpackingEnabled bool
 	// NodeDeletionBatcherInterval is a time for how long CA ScaleDown gather nodes to delete them in batch.
 	NodeDeletionBatcherInterval time.Duration
 	// SkipNodesWithSystemPods tells if nodes with pods from kube-system should be deleted (except for DaemonSet or mirror pods)
@@ -289,6 +303,8 @@ type AutoscalingOptions struct {
 	DynamicNodeDeleteDelayAfterTaintEnabled bool
 	// BypassedSchedulers are used to specify which schedulers to bypass their processing
 	BypassedSchedulers map[string]bool
+	// AllowedSchedulers when specified CA will proceed only with pods that are targeting allowed schedulers from unschedulable pods and unprocessed pods by BypassedSchedulers.
+	AllowedSchedulers map[string]bool
 	// ProvisioningRequestEnabled tells if CA processes ProvisioningRequest.
 	ProvisioningRequestEnabled bool
 	// AsyncNodeGroupsEnabled tells if CA creates/deletes node groups asynchronously.
@@ -311,8 +327,10 @@ type AutoscalingOptions struct {
 	ForceDeleteFailedNodes bool
 	// DynamicResourceAllocationEnabled configures whether logic for handling DRA objects is enabled.
 	DynamicResourceAllocationEnabled bool
-	// ClusterSnapshotParallelism is the maximum parallelism of cluster snapshot creation.
-	ClusterSnapshotParallelism int
+	// CSINodeAwareSchedulingEnabled configures whether logic for handling CSINode objects is enabled.
+	CSINodeAwareSchedulingEnabled bool
+	// PredicateParallelism is the number of goroutines to use for running scheduler predicates.
+	PredicateParallelism int
 	// CheckCapacityProcessorInstance is the name of the processor instance.
 	// Only ProvisioningRequests that define this name in their parameters with the key "processorInstance" will be processed by this CA instance.
 	// It only refers to check capacity ProvisioningRequests, but if not empty, best-effort atomic ProvisioningRequests processing is disabled in this instance.
@@ -322,6 +340,8 @@ type AutoscalingOptions struct {
 	MaxInactivityTime time.Duration
 	// MaxFailingTime is the maximum duration without a successful autoscaler run before it is considered unhealthy.
 	MaxFailingTime time.Duration
+	// MaxStartupTime is the maximum duration until the first successful autoscaler run before it is considered unhealthy.
+	MaxStartupTime time.Duration
 	// DebuggingSnapshotEnabled is used to enable/disable debugging snapshot creation.
 	DebuggingSnapshotEnabled bool
 	// EnableProfiling is debug/pprof endpoint enabled.
@@ -349,6 +369,15 @@ type AutoscalingOptions struct {
 	CapacitybufferControllerEnabled bool
 	// CapacitybufferPodInjectionEnabled tells if CA should injects fake pods for capacity buffers that are ready for provisioning
 	CapacitybufferPodInjectionEnabled bool
+	// CapacityBufferPodDryRunEnabled tells if CA should use server dry run to build managed pod templates for the buffers
+	CapacityBufferPodDryRunEnabled bool
+	// MaxNodeSkipEvalTimeTrackerEnabled is used to enabled/disable the tracking of maximum evaluation time of a node being skipped during ScaleDown.
+	MaxNodeSkipEvalTimeTrackerEnabled bool
+	// NodeRemovalLatencyTrackingEnabled is used to enable/disable node removal latency tracking.
+	NodeRemovalLatencyTrackingEnabled bool
+	CapacityQuotasEnabled             bool
+	// ScaleUpSimulationForSkippedNodeGroupsEnabled is used to enable/disable the scaleUpSimulation for the skipped node groups
+	ScaleUpSimulationForSkippedNodeGroupsEnabled bool
 }
 
 // KubeClientOptions specify options for kube client
